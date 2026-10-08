@@ -46,6 +46,28 @@ pub struct RwLock<T> {
 unsafe impl<T: Send> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
+/// 提取读者数量：低12bit
+macro_rules! reader_count {
+    ($s:expr) => {
+        ($s & READER_MASK)
+    };
+}
+
+/// 提取写者数量：bit30是否置位，0或1
+macro_rules! writer_hold {
+    ($s:expr) => {
+        ((($s >> 30) & 1) == 1)
+    };
+}
+
+/// 是否有写者在等待：bit31，返回u32，1代表等待
+macro_rules! writer_is_waiting {
+    ($s:expr) => {
+        ((($s >> 31) & 1) == 1)
+    };
+}
+
+
 impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
@@ -63,7 +85,20 @@ impl<T> RwLock<T> {
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         // TODO
-        todo!()
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if writer_hold!(state) || writer_is_waiting!(state) {
+                core::hint::spin_loop();
+                continue;
+            }
+            if reader_count!(state) == READER_MASK {
+                core::hint::spin_loop();
+                continue;
+            }
+            if let Ok(_) = self.state.compare_exchange(state, state + 1, Ordering::AcqRel, Ordering::Acquire) {
+                return RwLockReadGuard { lock: self };
+            }
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
@@ -75,7 +110,18 @@ impl<T> RwLock<T> {
     /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         // TODO
-        todo!()
+        self.state.fetch_or(WRITER_WAITING, Ordering::Release);
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if reader_count!(state) > 0 || writer_hold!(state) {
+                core::hint::spin_loop();
+                continue;
+            }
+            
+            if let Ok(_) = self.state.compare_exchange(state & (!READER_MASK) & (!WRITER_HOLDING), state & (!READER_MASK) & (!WRITER_HOLDING) | (WRITER_HOLDING), Ordering::AcqRel, Ordering::Acquire) {
+                return RwLockWriteGuard { lock: self };
+            }
+        }
     }
 }
 
@@ -90,7 +136,7 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +144,7 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +159,7 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,7 +167,7 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -129,7 +175,7 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 // Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release);
     }
 }
 

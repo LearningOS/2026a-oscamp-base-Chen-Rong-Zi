@@ -103,7 +103,9 @@ impl Sv39PageTable {
     /// 提示：右移 (12 + level * 9) 位，然后与 0x1FF 做掩码。
     pub fn extract_vpn(va: u64, level: usize) -> usize {
         // TODO: 从虚拟地址中提取指定级别的 VPN 索引
-        todo!()
+        (
+            (va >> (12 + level * 9)) & 0x1FF
+        ) as usize
     }
 
     /// 建立从虚拟页到物理页的映射（4KB 页）。
@@ -119,7 +121,26 @@ impl Sv39PageTable {
         // 对于中间层级（level 2 和 level 1），如果对应 VPN 的页表项（PTE）无效（PTE_V == 0），
         // 则需要分配一个新的页表节点（使用 alloc_node），并将新节点的 PPN 写入当前 PTE（仅设置 PTE_V 标志）。
         // 最后在 level 0 的 PTE 中写入目标物理页号（pa >> 12）和 flags。
-        todo!()
+        let mut level = 2;
+        let mut ppn = self.root_ppn;
+        while level != 0 {
+            let index = Self::extract_vpn(va, level);
+            let pte = self.nodes.get(&ppn).map(|x|x.entries[index]).unwrap();
+            if pte & PTE_V == 0 {
+                let new_ppn = self.alloc_node();
+                let table = self.nodes.get_mut(&ppn).unwrap();
+                table.entries[index] = (new_ppn << PPN_SHIFT) | PTE_V;
+            }
+            let table = self.nodes.get_mut(&ppn).unwrap();
+            let next_ppn = table.entries[index] >> PPN_SHIFT;
+            ppn = next_ppn;
+            level -= 1;
+        }
+        let target_ppn = pa >> 12;
+        let leaf_pte = (target_ppn << PPN_SHIFT) | flags | PTE_V;
+        let index = Self::extract_vpn(va, 0);
+        let table = self.nodes.get_mut(&ppn).unwrap();
+        table.entries[index] = leaf_pte;
     }
 
     /// 遍历三级页表，将虚拟地址翻译为物理地址。
@@ -141,7 +162,37 @@ impl Sv39PageTable {
         // 如果 PTE 是叶节点（即 R、W、X 标志位中有至少一个被置位），则可以直接使用该 PTE 中的物理页号（PPN）计算最终的物理地址。
         // 否则，该 PTE 指向下一级页表节点，继续遍历下一级。
         // 遍历到 level 0 时，PTE 必须是叶节点。
-        todo!()
+        let (mut level, mut ppn) = (2, self.root_ppn);
+        while level != 0 {
+            let index = Self::extract_vpn(va, level);
+            if let Some(table) = self.nodes.get(&ppn) {
+                if (table.entries[index] & PTE_V) == 0 {
+                    return TranslateResult::PageFault;
+                }
+                else if (table.entries[index] & (PTE_R | PTE_W | PTE_X)) != 0 {
+                    let offset = (va & (0x1FFFFF)) as u64;
+                    return TranslateResult::Ok(((table.entries[index]) >> PPN_SHIFT) * (PAGE_SIZE as u64) + offset);
+                }
+                ppn = table.entries[index] >> PPN_SHIFT;
+                level -= 1;
+            }
+            else {
+                return TranslateResult::PageFault;
+            }
+        }
+        let index = Self::extract_vpn(va, 0);
+        if let Some(table) = self.nodes.get(&ppn) {
+            let offset = (va & (0xFFF)) as u64;
+            if table.entries[index] & PTE_V == 0 || (table.entries[index] & (PTE_R | PTE_W | PTE_X)) == 0 {
+                TranslateResult::PageFault
+            }
+            else {
+                TranslateResult::Ok(((table.entries[index]) >> PPN_SHIFT) * (PAGE_SIZE as u64) + offset)
+            }
+        }
+        else {
+            TranslateResult::PageFault
+        }
     }
 
     /// 建立大页映射（2MB superpage，在 level 1 设叶子 PTE）。
@@ -160,7 +211,22 @@ impl Sv39PageTable {
         // 你需要在 level 2 找到或创建中间页表节点，然后在 level 1 写入叶子 PTE。
         // 注意大页的物理页号计算方式与普通页相同（pa >> 12），
         // 但翻译时 offset 包含虚拟地址的低 21 位（VPN[0] 部分 + 12 位页内偏移）。
-        todo!()
+        let mut ppn = self.root_ppn;
+        let index = Self::extract_vpn(va, 2);
+        let pte = self.nodes.get(&ppn).map(|x|x.entries[index]).unwrap();
+        if pte & PTE_V == 0 {
+            let new_ppn = self.alloc_node();
+            let table = self.nodes.get_mut(&ppn).unwrap();
+            table.entries[index] = (new_ppn << PPN_SHIFT) | PTE_V;
+        }
+        let table = self.nodes.get_mut(&ppn).unwrap();
+        let next_ppn = table.entries[index] >> PPN_SHIFT;
+        ppn = next_ppn;
+        let target_ppn = pa >> 12;
+        let leaf_pte = (target_ppn << PPN_SHIFT) | flags | PTE_V;
+        let index = Self::extract_vpn(va, 1);
+        let table = self.nodes.get_mut(&ppn).unwrap();
+        table.entries[index] = leaf_pte;
     }
 }
 
